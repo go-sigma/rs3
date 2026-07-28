@@ -58,7 +58,7 @@ export RS3_ENDPOINT=http://localhost:9000
 export RS3_ACCESS_KEY=local-access
 export RS3_SECRET_KEY=local-secret
 
-cargo run --release --bin rs3-cli -- mb s3://mybucket
+cargo run --release --bin rs3-cli -- mb --ensure s3://mybucket
 cargo run --release --bin rs3-cli -- cp ./file.txt s3://mybucket/
 cargo run --release --bin rs3-cli -- ls s3://mybucket/
 ```
@@ -89,7 +89,7 @@ export RS3_ENDPOINT=http://localhost:9000
 export RS3_ACCESS_KEY=local-access
 export RS3_SECRET_KEY=local-secret
 
-cargo run --release --bin rs3-cli -- mb s3://mybucket
+cargo run --release --bin rs3-cli -- mb --ensure s3://mybucket
 cargo run --release --bin rs3-cli -- cp ./photo.jpg s3://mybucket/photos/
 cargo run --release --bin rs3-cli -- ls --recursive s3://mybucket/
 cargo run --release --bin rs3-cli -- stat s3://mybucket/photos/photo.jpg

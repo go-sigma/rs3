@@ -6,7 +6,7 @@ use quick_xml::events::Event;
 use reqwest::header::{
     AUTHORIZATION, CONTENT_LENGTH, ETAG, HOST, HeaderMap, HeaderValue, LAST_MODIFIED,
 };
-use reqwest::{Method, Response, Url};
+use reqwest::{Method, Response, StatusCode, Url};
 
 use crate::auth::{Credentials, sign_request};
 
@@ -138,6 +138,20 @@ impl S3Client {
         Ok(())
     }
 
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool> {
+        let response = self
+            .request(Method::HEAD, &bucket_path(bucket), "", Vec::new())
+            .await?;
+        match response.status() {
+            status if status.is_success() => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => {
+                ensure_success(response).await?;
+                Ok(true)
+            }
+        }
+    }
+
     pub async fn remove_bucket(&self, bucket: &str) -> Result<()> {
         self.send(Method::DELETE, &bucket_path(bucket), "", Vec::new())
             .await?;
@@ -228,6 +242,16 @@ impl S3Client {
         query: &str,
         body: Vec<u8>,
     ) -> Result<Response> {
+        ensure_success(self.request(method, path, query, body).await?).await
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &str,
+        body: Vec<u8>,
+    ) -> Result<Response> {
         let signed = sign_request(
             method.as_str(),
             path,
@@ -252,19 +276,23 @@ impl S3Client {
             .body(body)
             .send()
             .await?;
-        if response.status().is_success() {
-            return Ok(response);
-        }
-        let status = response.status();
-        let body = response.bytes().await.unwrap_or_default();
-        let (code, message) = parse_error(&body);
-        bail!(
-            "S3 request failed: {} {}: {}",
-            status.as_u16(),
-            code.unwrap_or_else(|| status.to_string()),
-            message.unwrap_or_else(|| "unknown error".to_owned())
-        )
+        Ok(response)
     }
+}
+
+async fn ensure_success(response: Response) -> Result<Response> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
+    let status = response.status();
+    let body = response.bytes().await.unwrap_or_default();
+    let (code, message) = parse_error(&body);
+    bail!(
+        "S3 request failed: {} {}: {}",
+        status.as_u16(),
+        code.unwrap_or_else(|| status.to_string()),
+        message.unwrap_or_else(|| "unknown error".to_owned())
+    )
 }
 
 fn bucket_path(bucket: &str) -> String {

@@ -47,6 +47,10 @@ struct Cli {
 enum Command {
     /// Create a bucket
     Mb {
+        /// Succeed when the bucket already exists, otherwise create it
+        #[arg(long)]
+        ensure: bool,
+
         /// Bucket name or s3://bucket
         bucket: String,
     },
@@ -101,8 +105,12 @@ async fn main() -> Result<()> {
     let client = S3Client::new(&cli.endpoint, cli.access_key, cli.secret_key, cli.region)?;
 
     match cli.command {
-        Command::Mb { bucket } => {
+        Command::Mb { bucket, ensure } => {
             let bucket = S3Path::bucket(&bucket)?;
+            if ensure && client.bucket_exists(&bucket).await? {
+                println!("Exists s3://{bucket}");
+                return Ok(());
+            }
             client.make_bucket(&bucket).await?;
             println!("Created s3://{bucket}");
         }
@@ -259,11 +267,25 @@ fn human_size(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::human_size;
+    use clap::Parser;
+
+    use super::{Cli, Command, human_size};
 
     #[test]
     fn formats_human_readable_sizes() {
         assert_eq!(human_size(10), "10 B");
         assert_eq!(human_size(1536), "1.5 KiB");
+    }
+
+    #[test]
+    fn parses_ensure_make_bucket_option() {
+        let cli = Cli::parse_from(["rs3-cli", "mb", "--ensure", "s3://bucket"]);
+        match cli.command {
+            Command::Mb { bucket, ensure } => {
+                assert_eq!(bucket, "s3://bucket");
+                assert!(ensure);
+            }
+            _ => panic!("expected mb command"),
+        }
     }
 }
