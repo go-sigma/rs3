@@ -133,27 +133,19 @@ impl S3Client {
     }
 
     pub async fn make_bucket(&self, bucket: &str) -> Result<()> {
-        self.success(
-            self.request(Method::PUT, &bucket_path(bucket), "", Vec::new())
-                .await?,
-        )
-        .await?;
+        self.send(Method::PUT, &bucket_path(bucket), "", Vec::new())
+            .await?;
         Ok(())
     }
 
     pub async fn remove_bucket(&self, bucket: &str) -> Result<()> {
-        self.success(
-            self.request(Method::DELETE, &bucket_path(bucket), "", Vec::new())
-                .await?,
-        )
-        .await?;
+        self.send(Method::DELETE, &bucket_path(bucket), "", Vec::new())
+            .await?;
         Ok(())
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketEntry>> {
-        let response = self
-            .success(self.request(Method::GET, "/", "", Vec::new()).await?)
-            .await?;
+        let response = self.send(Method::GET, "/", "", Vec::new()).await?;
         parse_bucket_entries(&response.bytes().await?)
     }
 
@@ -179,10 +171,7 @@ impl S3Client {
             }
             let query = encode_query(&query);
             let response = self
-                .success(
-                    self.request(Method::GET, &bucket_path(bucket), &query, Vec::new())
-                        .await?,
-                )
+                .send(Method::GET, &bucket_path(bucket), &query, Vec::new())
                 .await?;
             let page = parse_list_page(&response.bytes().await?)?;
             entries.extend(page.entries);
@@ -198,39 +187,21 @@ impl S3Client {
     }
 
     pub async fn put_object(&self, path: &S3Path, body: Vec<u8>) -> Result<()> {
-        if path.key.is_empty() {
-            bail!("object path must include a key");
-        }
-        self.success(
-            self.request(Method::PUT, &object_path(path), "", body)
-                .await?,
-        )
-        .await?;
+        self.send(Method::PUT, &object_path(path)?, "", body)
+            .await?;
         Ok(())
     }
 
     pub async fn get_object(&self, path: &S3Path) -> Result<Vec<u8>> {
-        if path.key.is_empty() {
-            bail!("object path must include a key");
-        }
         let response = self
-            .success(
-                self.request(Method::GET, &object_path(path), "", Vec::new())
-                    .await?,
-            )
+            .send(Method::GET, &object_path(path)?, "", Vec::new())
             .await?;
         Ok(response.bytes().await?.to_vec())
     }
 
     pub async fn stat_object(&self, path: &S3Path) -> Result<ObjectMetadata> {
-        if path.key.is_empty() {
-            bail!("object path must include a key");
-        }
         let response = self
-            .success(
-                self.request(Method::HEAD, &object_path(path), "", Vec::new())
-                    .await?,
-            )
+            .send(Method::HEAD, &object_path(path)?, "", Vec::new())
             .await?;
         Ok(ObjectMetadata {
             size: response
@@ -245,18 +216,12 @@ impl S3Client {
     }
 
     pub async fn remove_object(&self, path: &S3Path) -> Result<()> {
-        if path.key.is_empty() {
-            bail!("object path must include a key");
-        }
-        self.success(
-            self.request(Method::DELETE, &object_path(path), "", Vec::new())
-                .await?,
-        )
-        .await?;
+        self.send(Method::DELETE, &object_path(path)?, "", Vec::new())
+            .await?;
         Ok(())
     }
 
-    async fn request(
+    async fn send(
         &self,
         method: Method,
         path: &str,
@@ -287,10 +252,6 @@ impl S3Client {
             .body(body)
             .send()
             .await?;
-        Ok(response)
-    }
-
-    async fn success(&self, response: Response) -> Result<Response> {
         if response.status().is_success() {
             return Ok(response);
         }
@@ -310,12 +271,15 @@ fn bucket_path(bucket: &str) -> String {
     format!("/{}", aws_encode(bucket, true))
 }
 
-fn object_path(path: &S3Path) -> String {
-    format!(
+fn object_path(path: &S3Path) -> Result<String> {
+    if path.key.is_empty() {
+        bail!("object path must include a key");
+    }
+    Ok(format!(
         "/{}/{}",
         aws_encode(&path.bucket, true),
         aws_encode(&path.key, false)
-    )
+    ))
 }
 
 fn encode_query(values: &[(&str, String)]) -> String {
@@ -448,13 +412,13 @@ fn parse_error(xml: &[u8]) -> (Option<String>, Option<String>) {
                 code = reader
                     .read_text(start.name())
                     .ok()
-                    .map(|value| value.into_owned());
+                    .map(std::borrow::Cow::into_owned);
             }
             Ok(Event::Start(start)) if start.name().as_ref() == b"Message" => {
                 message = reader
                     .read_text(start.name())
                     .ok()
-                    .map(|value| value.into_owned());
+                    .map(std::borrow::Cow::into_owned);
             }
             Ok(Event::Eof) | Err(_) => break,
             Ok(_) => {}
@@ -506,13 +470,13 @@ mod tests {
     #[test]
     fn parses_bucket_and_list_xml() {
         let buckets = parse_bucket_entries(
-            br#"<ListAllMyBucketsResult><Buckets><Bucket><Name>demo</Name><CreationDate>now</CreationDate></Bucket></Buckets></ListAllMyBucketsResult>"#,
+            br"<ListAllMyBucketsResult><Buckets><Bucket><Name>demo</Name><CreationDate>now</CreationDate></Bucket></Buckets></ListAllMyBucketsResult>",
         )
         .unwrap();
         assert_eq!(buckets[0].name, "demo");
 
         let page = parse_list_page(
-            br#"<ListBucketResult><Contents><Key>a.txt</Key><LastModified>now</LastModified><Size>3</Size></Contents><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes><IsTruncated>false</IsTruncated></ListBucketResult>"#,
+            br"<ListBucketResult><Contents><Key>a.txt</Key><LastModified>now</LastModified><Size>3</Size></Contents><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes><IsTruncated>false</IsTruncated></ListBucketResult>",
         )
         .unwrap();
         assert_eq!(page.entries.len(), 2);

@@ -38,12 +38,12 @@ impl Storage {
     }
 
     pub fn object_path(&self, bucket: &str, key: &str) -> PathBuf {
-        let effective_key = if key.ends_with('/') {
-            format!("{key}{FOLDER_MARKER}")
+        let bucket = self.bucket_path(bucket);
+        if key.ends_with('/') {
+            bucket.join(format!("{key}{FOLDER_MARKER}"))
         } else {
-            key.to_owned()
-        };
-        self.bucket_path(bucket).join(effective_key)
+            bucket.join(key)
+        }
     }
 
     pub async fn create_bucket(&self, bucket: &str) -> io::Result<()> {

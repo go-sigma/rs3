@@ -22,6 +22,7 @@ use crate::storage::{ObjectInfo, Storage, md5_etag};
 const MAX_BODY_SIZE: usize = 5 * 1024 * 1024 * 1024;
 const MAX_KEY_LENGTH: usize = 1024;
 const MAX_BUCKET_LENGTH: usize = 63;
+const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -67,31 +68,25 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
         );
     }
 
-    let raw_body = match to_bytes(body, MAX_BODY_SIZE).await {
-        Ok(body) => body,
-        Err(_) => {
-            return finish_head(
-                s3_error(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "EntityTooLarge",
-                    "Request body exceeds the configured limit",
-                ),
-                is_head,
-            );
-        }
+    let Ok(raw_body) = to_bytes(body, MAX_BODY_SIZE).await else {
+        return finish_head(
+            s3_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "EntityTooLarge",
+                "Request body exceeds the configured limit",
+            ),
+            is_head,
+        );
     };
-    let body = match decode_request_body(&parts.headers, &raw_body) {
-        Ok(body) => body,
-        Err(()) => {
-            return finish_head(
-                s3_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRequest",
-                    "Malformed aws-chunked request body",
-                ),
-                is_head,
-            );
-        }
+    let Ok(body) = decode_request_body(&parts.headers, &raw_body) else {
+        return finish_head(
+            s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Malformed aws-chunked request body",
+            ),
+            is_head,
+        );
     };
     if auth::verify_payload(&parts, &body).is_err() {
         return finish_head(
@@ -104,18 +99,15 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
         );
     }
 
-    let decoded_path = match decode_path(parts.uri.path()) {
-        Ok(path) => path,
-        Err(()) => {
-            return finish_head(
-                s3_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidURI",
-                    "URI path is not valid UTF-8",
-                ),
-                is_head,
-            );
-        }
+    let Ok(decoded_path) = decode_path(parts.uri.path()) else {
+        return finish_head(
+            s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidURI",
+                "URI path is not valid UTF-8",
+            ),
+            is_head,
+        );
     };
     let (bucket, key) = split_path(&decoded_path);
     if !bucket.is_empty() && !is_valid_bucket_name(bucket) {
@@ -290,13 +282,7 @@ async fn get_object(state: &AppState, bucket: &str, key: &str, headers: &HeaderM
     };
 
     let full_len = data.len() as u64;
-    let mut builder = response_builder(StatusCode::OK)
-        .header(ACCEPT_RANGES, "bytes")
-        .header(ETAG, md5_etag(&data))
-        .header(
-            LAST_MODIFIED,
-            http_date(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
-        );
+    let builder = object_response_builder(StatusCode::OK, &data, &metadata);
 
     if let Some(range) = headers
         .get("range")
@@ -304,19 +290,14 @@ async fn get_object(state: &AppState, bucket: &str, key: &str, headers: &HeaderM
         .and_then(|value| parse_range(value, full_len))
     {
         let body = data[range.0 as usize..=range.1 as usize].to_vec();
-        builder = response_builder(StatusCode::PARTIAL_CONTENT)
-            .header(ACCEPT_RANGES, "bytes")
-            .header(ETAG, md5_etag(&data))
-            .header(
-                LAST_MODIFIED,
-                http_date(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
-            )
+        return object_response_builder(StatusCode::PARTIAL_CONTENT, &data, &metadata)
             .header(
                 CONTENT_RANGE,
                 format!("bytes {}-{}/{}", range.0, range.1, full_len),
             )
-            .header(CONTENT_LENGTH, body.len().to_string());
-        return builder.body(Body::from(body)).expect("valid response");
+            .header(CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body))
+            .expect("valid response");
     }
 
     builder
@@ -337,14 +318,8 @@ async fn head_object(state: &AppState, bucket: &str, key: &str) -> Response {
         Ok(data) => data,
         Err(error) => return internal_error("Cannot read object", error),
     };
-    response_builder(StatusCode::OK)
+    object_response_builder(StatusCode::OK, &data, &metadata)
         .header(CONTENT_LENGTH, metadata.len().to_string())
-        .header(ACCEPT_RANGES, "bytes")
-        .header(ETAG, md5_etag(&data))
-        .header(
-            LAST_MODIFIED,
-            http_date(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
-        )
         .body(Body::empty())
         .expect("valid response")
 }
@@ -376,24 +351,21 @@ async fn list_objects(state: &AppState, bucket: &str, query: &Query) -> Response
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1000);
 
-    let entries = make_list_entries(
-        objects,
-        &prefix,
-        delimiter.as_deref(),
-        continuation.as_deref(),
-    );
+    let entries = make_list_entries(objects, prefix, delimiter, continuation);
     let truncated = entries.len() > max_keys;
     let selected = entries.iter().take(max_keys).collect::<Vec<_>>();
-    let next_token = truncated
-        .then(|| selected.last().map(|entry| entry.marker()))
-        .flatten();
+    let next_token = if truncated {
+        selected.last().map(|entry| entry.marker())
+    } else {
+        None
+    };
 
     let mut xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Name>{}</Name><Prefix>{}</Prefix><MaxKeys>{}</MaxKeys>",
         xml_escape(bucket),
-        xml_escape(&prefix),
+        xml_escape(prefix),
         max_keys
     );
     for entry in &selected {
@@ -404,7 +376,7 @@ async fn list_objects(state: &AppState, bucket: &str, query: &Query) -> Response
                 xml.push_str("</Key><LastModified>");
                 xml.push_str(&iso8601(object.modified));
                 xml.push_str("</LastModified><ETag>\"");
-                xml.push_str(&empty_md5());
+                xml.push_str(EMPTY_MD5);
                 xml.push_str("</ETag><Size>");
                 xml.push_str(&object.size.to_string());
                 xml.push_str("</Size><StorageClass>STANDARD</StorageClass></Contents>");
@@ -438,15 +410,12 @@ async fn delete_objects(state: &AppState, bucket: &str, body: &[u8]) -> Response
             "Bucket does not exist",
         );
     }
-    let keys = match parse_xml_values(body, b"Key") {
-        Ok(keys) => keys,
-        Err(()) => {
-            return s3_error(
-                StatusCode::BAD_REQUEST,
-                "MalformedXML",
-                "Delete request XML is invalid",
-            );
-        }
+    let Ok(keys) = parse_xml_values(body, b"Key") else {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "Delete request XML is invalid",
+        );
     };
     let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                    <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
@@ -508,12 +477,12 @@ async fn upload_part(
     else {
         return invalid_request("Invalid partNumber");
     };
-    if !is_valid_upload_id(&upload_id) {
+    if !is_valid_upload_id(upload_id) {
         return invalid_request("Invalid uploadId");
     }
     match state
         .storage
-        .put_part(&upload_id, bucket, key, part_number, body)
+        .put_part(upload_id, bucket, key, part_number, body)
         .await
     {
         Ok(etag) => response_builder(StatusCode::OK)
@@ -539,7 +508,7 @@ async fn complete_multipart(
     let Some(upload_id) = query.get("uploadId") else {
         return invalid_request("Missing uploadId");
     };
-    if !is_valid_upload_id(&upload_id) {
+    if !is_valid_upload_id(upload_id) {
         return invalid_request("Invalid uploadId");
     }
     let requested_parts = parse_xml_values(body, b"PartNumber")
@@ -549,7 +518,7 @@ async fn complete_multipart(
         .collect::<Vec<_>>();
     match state
         .storage
-        .complete_upload(&upload_id, bucket, key, &requested_parts)
+        .complete_upload(upload_id, bucket, key, &requested_parts)
         .await
     {
         Ok(completed) => xml_response(
@@ -577,10 +546,10 @@ async fn abort_multipart(state: &AppState, bucket: &str, key: &str, query: &Quer
     let Some(upload_id) = query.get("uploadId") else {
         return invalid_request("Missing uploadId");
     };
-    if !is_valid_upload_id(&upload_id) {
+    if !is_valid_upload_id(upload_id) {
         return invalid_request("Invalid uploadId");
     }
-    match state.storage.abort_upload(&upload_id, bucket, key).await {
+    match state.storage.abort_upload(upload_id, bucket, key).await {
         Ok(()) => empty_response(StatusCode::NO_CONTENT),
         Err(error) if error.kind() == io::ErrorKind::NotFound => s3_error(
             StatusCode::NOT_FOUND,
@@ -658,21 +627,21 @@ impl Query {
     }
 
     fn has(&self, name: &str) -> bool {
-        self.values.iter().any(|(key, _)| key == name)
+        self.get(name).is_some()
     }
 
-    fn get(&self, name: &str) -> Option<String> {
+    fn get(&self, name: &str) -> Option<&str> {
         self.values
             .iter()
             .find(|(key, _)| key == name)
-            .map(|(_, value)| value.clone())
+            .map(|(_, value)| value.as_str())
     }
 }
 
 fn decode_path(raw_path: &str) -> Result<String, ()> {
     percent_decode_str(raw_path.trim_start_matches('/'))
         .decode_utf8()
-        .map(|path| path.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|_| ())
 }
 
@@ -803,6 +772,20 @@ fn response_builder(status: StatusCode) -> axum::http::response::Builder {
     Response::builder().status(status)
 }
 
+fn object_response_builder(
+    status: StatusCode,
+    data: &[u8],
+    metadata: &std::fs::Metadata,
+) -> axum::http::response::Builder {
+    response_builder(status)
+        .header(ACCEPT_RANGES, "bytes")
+        .header(ETAG, md5_etag(data))
+        .header(
+            LAST_MODIFIED,
+            http_date(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)),
+        )
+}
+
 fn empty_response(status: StatusCode) -> Response {
     response_builder(status)
         .body(Body::empty())
@@ -855,10 +838,6 @@ fn http_date(time: SystemTime) -> String {
     DateTime::<Utc>::from(time)
         .format("%a, %d %b %Y %H:%M:%S GMT")
         .to_string()
-}
-
-fn empty_md5() -> String {
-    md5_etag(b"").trim_matches('"').to_owned()
 }
 
 #[cfg(test)]

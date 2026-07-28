@@ -145,11 +145,7 @@ pub fn verify(parts: &Parts, credentials: &Credentials) -> Result<(), AuthError>
         string_to_sign.as_bytes(),
     );
 
-    if expected
-        .as_bytes()
-        .ct_eq(parsed.signature.to_ascii_lowercase().as_bytes())
-        .into()
-    {
+    if constant_time_hex_eq(&expected, parsed.signature) {
         Ok(())
     } else {
         Err(AuthError::SignatureMismatch)
@@ -169,11 +165,7 @@ pub fn verify_payload(parts: &Parts, body: &[u8]) -> Result<(), AuthError> {
     }
 
     let actual = hex::encode(Sha256::digest(body));
-    if actual
-        .as_bytes()
-        .ct_eq(payload_hash.to_ascii_lowercase().as_bytes())
-        .into()
-    {
+    if constant_time_hex_eq(&actual, payload_hash) {
         Ok(())
     } else {
         Err(AuthError::PayloadHashMismatch)
@@ -268,6 +260,13 @@ fn normalize_header_value(value: &str) -> String {
 
 fn header<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
     parts.headers.get(name)?.to_str().ok()
+}
+
+fn constant_time_hex_eq(expected: &str, provided: &str) -> bool {
+    expected
+        .as_bytes()
+        .ct_eq(provided.to_ascii_lowercase().as_bytes())
+        .into()
 }
 
 fn calculate_signature(
