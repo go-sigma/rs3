@@ -1,0 +1,32 @@
+[package]
+name = "rs3"
+version = "0.1.0"
+edition = "2024"
+description = "A small S3-compatible storage server"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+bytes = "1.10"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+hmac = "0.12"
+md-5 = "0.10"
+percent-encoding = "2.3"
+quick-xml = "0.37"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2 = "0.10"
+subtle = "2.6"
+tokio = { version = "1.44", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2.5"
+uuid = { version = "1.16", features = ["v4"] }
+walkdir = "2.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
