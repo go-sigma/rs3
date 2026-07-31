@@ -51,7 +51,8 @@ sudo -u rs3 sh -c 'set -a; . /etc/rs3/rs3.env; exec /usr/local/bin/rs3'
 ## Docker
 
 The included `Dockerfile` builds both binaries and creates a Debian runtime
-image with CA certificates. The process runs as UID and GID `10001`.
+image with CA certificates and `curl` for its health check. The process runs
+as UID and GID `10001`.
 
 ```bash
 docker build --tag rs3:local .
@@ -82,17 +83,17 @@ docker run --rm \
 
 ## Availability Check
 
-The authenticated S3 root endpoint is the simplest application-level check:
+The unauthenticated health probes are intended for container and process
+supervision:
 
 ```bash
-RS3_ENDPOINT=http://localhost:9000 \
-RS3_ACCESS_KEY=replace-this-access-key \
-RS3_SECRET_KEY=replace-this-secret-key \
-target/release/rs3-cli ls
+curl --fail http://localhost:9000/healthz
+curl --fail http://localhost:9000/readyz
 ```
 
-An unsigned `GET /` returns `403`, which can be used as a basic process and
-listener check but does not validate credentials or storage access.
+`/healthz` checks that the HTTP server is responding. `/readyz` also checks
+that the configured data directory exists, is a directory, and is readable.
+The Docker image uses `/readyz` for its `HEALTHCHECK`.
 
 ## Backup and Restore
 

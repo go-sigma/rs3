@@ -60,6 +60,18 @@ impl Storage {
             .is_ok_and(|metadata| metadata.is_dir())
     }
 
+    pub async fn is_ready(&self) -> io::Result<()> {
+        let metadata = fs::metadata(&self.root).await?;
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "storage root is not a directory",
+            ));
+        }
+        let _ = fs::read_dir(&self.root).await?;
+        Ok(())
+    }
+
     pub async fn delete_bucket(&self, bucket: &str) -> io::Result<()> {
         fs::remove_dir(self.bucket_path(bucket)).await
     }

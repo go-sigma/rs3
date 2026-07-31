@@ -50,6 +50,10 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
     let (parts, body) = request.into_parts();
     let is_head = parts.method == Method::HEAD;
 
+    if let Some(response) = probe(&state, &parts.method, parts.uri.path()).await {
+        return finish_head(response, is_head);
+    }
+
     if parts.uri.path().starts_with("/_rs3/") {
         return finish_head(
             s3_error(
@@ -143,6 +147,26 @@ pub async fn handle(State(state): State<AppState>, request: Request) -> Response
     )
     .await;
     finish_head(response, is_head)
+}
+
+async fn probe(state: &AppState, method: &Method, path: &str) -> Option<Response> {
+    let status = match path {
+        "/healthz" => StatusCode::OK,
+        "/readyz" => match state.storage.is_ready().await {
+            Ok(()) => StatusCode::OK,
+            Err(error) => return Some(internal_error("Storage is not ready", error)),
+        },
+        _ => return None,
+    };
+
+    Some(match method {
+        &Method::GET | &Method::HEAD => text_response(status, "ok\n"),
+        _ => s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "Method not allowed",
+        ),
+    })
 }
 
 async fn dispatch(
@@ -800,6 +824,14 @@ fn xml_response(status: StatusCode, xml: String) -> Response {
         .expect("valid response")
 }
 
+fn text_response(status: StatusCode, body: &'static str) -> Response {
+    response_builder(status)
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CONTENT_LENGTH, body.len().to_string())
+        .body(Body::from(body))
+        .expect("valid response")
+}
+
 fn s3_error(status: StatusCode, code: &str, message: &str) -> Response {
     xml_response(
         status,
@@ -842,9 +874,17 @@ fn http_date(time: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_request_body, is_valid_bucket_name, is_valid_key, parse_range};
-    use axum::http::{HeaderMap, HeaderValue};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{
+        AppState, decode_request_body, handle, is_valid_bucket_name, is_valid_key, parse_range,
+    };
+    use crate::config::Config;
+    use axum::body::{Body, to_bytes};
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use bytes::Bytes;
+    use uuid::Uuid;
 
     #[test]
     fn validates_bucket_names() {
@@ -884,5 +924,48 @@ mod tests {
             decode_request_body(&headers, &body).unwrap(),
             b"hello world"
         );
+    }
+
+    #[tokio::test]
+    async fn probes_do_not_require_s3_authentication() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+
+        let health = handle(State(state.clone()), request("/healthz")).await;
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(health.into_body(), usize::MAX).await.unwrap(),
+            "ok\n"
+        );
+
+        let ready = handle(State(state), request("/readyz")).await;
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn s3_paths_still_require_authentication() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+
+        let response = handle(State(state), request("/")).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    fn request(path: &str) -> Request<Body> {
+        Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    fn test_config(data_dir: std::path::PathBuf) -> Config {
+        Config {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            data_dir,
+            access_key: "access".to_owned(),
+            secret_key: "secret".to_owned(),
+        }
     }
 }

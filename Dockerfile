@@ -15,7 +15,7 @@ RUN cargo build --locked --release --bins
 FROM debian:trixie-slim AS runtime
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
     && apt-get clean \
     && find /var/lib/apt/lists -type f -delete \
     && groupadd --gid 10001 rs3 \
@@ -35,5 +35,8 @@ WORKDIR /var/lib/rs3
 
 VOLUME ["/var/lib/rs3/data"]
 EXPOSE 9000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl --fail "http://127.0.0.1:${RS3_PORT}/readyz" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/rs3"]

@@ -22,6 +22,7 @@ AWS S3 and does not provide distributed storage or multi-user authorization.
 - Multipart upload initiation, part upload, completion, and abort
 - AWS streaming chunk body decoding
 - Atomic object replacement through temporary files and rename
+- Unauthenticated `/healthz` and `/readyz` probes for container health checks
 - `rs3-cli` for common bucket and object operations
 - Multi-stage Docker image running as a non-root user
 
@@ -118,7 +119,8 @@ docker run --rm \
 ```
 
 The image contains `/usr/local/bin/rs3` and `/usr/local/bin/rs3-cli`, runs as
-`10001:10001`, and persists objects under `/var/lib/rs3/data`.
+`10001:10001`, persists objects under `/var/lib/rs3/data`, and checks
+`/readyz` through Docker `HEALTHCHECK`.
 
 See [deployment](docs/deployment.md) for native binary, backup, and container
 examples.
