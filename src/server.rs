@@ -185,7 +185,7 @@ async fn dispatch(
         (&Method::DELETE, false, true) => delete_bucket(state, bucket).await,
         (&Method::GET, false, true) => list_objects(state, bucket, query).await,
         (&Method::PUT, false, false) if query.has("uploadId") => {
-            upload_part(state, bucket, key, query, body).await
+            upload_part(state, bucket, key, query, headers, body).await
         }
         (&Method::PUT, false, false) => put_object(state, bucket, key, body).await,
         (&Method::GET, false, false) => get_object(state, bucket, key, headers).await,
@@ -489,6 +489,7 @@ async fn upload_part(
     bucket: &str,
     key: &str,
     query: &Query,
+    headers: &HeaderMap,
     body: &[u8],
 ) -> Response {
     let Some(upload_id) = query.get("uploadId") else {
@@ -504,6 +505,24 @@ async fn upload_part(
     if !is_valid_upload_id(upload_id) {
         return invalid_request("Invalid uploadId");
     }
+    if let Some(copy_source) = headers
+        .get("x-amz-copy-source")
+        .and_then(|value| value.to_str().ok())
+    {
+        let copy_range = headers
+            .get("x-amz-copy-source-range")
+            .and_then(|value| value.to_str().ok());
+        return upload_part_copy(
+            state,
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            copy_source,
+            copy_range,
+        )
+        .await;
+    }
     match state
         .storage
         .put_part(upload_id, bucket, key, part_number, body)
@@ -513,6 +532,89 @@ async fn upload_part(
             .header(ETAG, etag)
             .body(Body::empty())
             .expect("valid response"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "Multipart upload not found",
+        ),
+        Err(error) => internal_error("Cannot write multipart part", error),
+    }
+}
+
+async fn upload_part_copy(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: u32,
+    copy_source: &str,
+    copy_range: Option<&str>,
+) -> Response {
+    let Some((source_bucket, source_key)) = parse_copy_source(copy_source) else {
+        return invalid_request("Invalid copy source");
+    };
+    if !is_valid_bucket_name(&source_bucket) {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidBucketName",
+            "Source bucket name is invalid",
+        );
+    }
+    if !is_valid_key(&source_key) {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidKey",
+            "Source object key is invalid",
+        );
+    }
+    if !state.storage.bucket_exists(&source_bucket).await {
+        return s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "Source bucket does not exist",
+        );
+    }
+    let source = match state.storage.read_object(&source_bucket, &source_key).await {
+        Ok(data) => data,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "Source object not found",
+            );
+        }
+        Err(error) => return internal_error("Cannot read copy source", error),
+    };
+
+    let part = if let Some(range) = copy_range {
+        let Some((start, end)) = parse_copy_range(range, source.len() as u64) else {
+            return s3_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "InvalidRange",
+                "Copy source range is not satisfiable",
+            );
+        };
+        source[start as usize..=end as usize].to_vec()
+    } else {
+        source
+    };
+
+    match state
+        .storage
+        .put_part(upload_id, bucket, key, part_number, &part)
+        .await
+    {
+        Ok(etag) => xml_response(
+            StatusCode::OK,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <LastModified>{}</LastModified><ETag>{}</ETag>\
+                 </CopyPartResult>",
+                iso8601(SystemTime::now()),
+                etag
+            ),
+        ),
         Err(error) if error.kind() == io::ErrorKind::NotFound => s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",
@@ -698,6 +800,25 @@ fn is_valid_upload_id(upload_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn parse_copy_source(value: &str) -> Option<(String, String)> {
+    let value = value.split('?').next().unwrap_or(value);
+    let value = value.trim_start_matches('/');
+    let decoded = percent_decode_str(value).decode_utf8().ok()?;
+    let (bucket, key) = decoded.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket.to_owned(), key.to_owned()))
+}
+
+fn parse_copy_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
+    let range = header.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    (start <= end && end < file_size).then_some((start, end))
+}
+
 fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     let range = header.strip_prefix("bytes=")?;
     let (start, end) = range.split_once('-')?;
@@ -877,7 +998,8 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        AppState, decode_request_body, handle, is_valid_bucket_name, is_valid_key, parse_range,
+        AppState, decode_request_body, handle, is_valid_bucket_name, is_valid_key,
+        parse_copy_range, parse_copy_source, parse_range,
     };
     use crate::config::Config;
     use axum::body::{Body, to_bytes};
@@ -899,6 +1021,29 @@ mod tests {
         assert!(is_valid_key("folder/file.txt"));
         assert!(!is_valid_key("../etc/passwd"));
         assert!(!is_valid_key("a..b"));
+    }
+
+    #[test]
+    fn parses_copy_sources() {
+        assert_eq!(
+            parse_copy_source("/source-bucket/path/to/object.txt"),
+            Some(("source-bucket".to_owned(), "path/to/object.txt".to_owned()))
+        );
+        assert_eq!(
+            parse_copy_source("source-bucket/object%20name.txt?versionId=abc"),
+            Some(("source-bucket".to_owned(), "object name.txt".to_owned()))
+        );
+        assert_eq!(parse_copy_source("source-bucket"), None);
+        assert_eq!(parse_copy_source("/key-only"), None);
+    }
+
+    #[test]
+    fn parses_copy_ranges() {
+        assert_eq!(parse_copy_range("bytes=0-4", 20), Some((0, 4)));
+        assert_eq!(parse_copy_range("bytes=5-19", 20), Some((5, 19)));
+        assert_eq!(parse_copy_range("bytes=5-", 20), None);
+        assert_eq!(parse_copy_range("bytes=-5", 20), None);
+        assert_eq!(parse_copy_range("bytes=20-21", 20), None);
     }
 
     #[test]
@@ -940,6 +1085,108 @@ mod tests {
 
         let ready = handle(State(state), request("/readyz")).await;
         assert_eq!(ready.status(), StatusCode::OK);
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_copies_source_range() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state
+            .storage
+            .put_object("source", "object.txt", b"hello world")
+            .await
+            .unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+        let upload_id = state
+            .storage
+            .create_upload("target", "copy.txt")
+            .await
+            .unwrap();
+
+        let query = format!("partNumber=1&uploadId={upload_id}");
+        let signed = crate::auth::sign_request(
+            "PUT",
+            "/target/copy.txt",
+            &query,
+            "localhost:9000",
+            b"",
+            &state.credentials,
+            "us-east-1",
+        );
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/target/copy.txt?{query}"))
+            .header("host", "localhost:9000")
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.payload_hash)
+            .header("authorization", signed.authorization)
+            .header("x-amz-copy-source", "/source/object.txt")
+            .header("x-amz-copy-source-range", "bytes=6-10")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = handle(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<CopyPartResult"));
+        assert!(body.contains("<ETag>"));
+
+        state
+            .storage
+            .complete_upload(&upload_id, "target", "copy.txt", &[1])
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .storage
+                .read_object("target", "copy.txt")
+                .await
+                .unwrap(),
+            b"world"
+        );
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_part_copy_rejects_missing_source() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+        let upload_id = state
+            .storage
+            .create_upload("target", "copy.txt")
+            .await
+            .unwrap();
+
+        let query = format!("partNumber=1&uploadId={upload_id}");
+        let signed = crate::auth::sign_request(
+            "PUT",
+            "/target/copy.txt",
+            &query,
+            "localhost:9000",
+            b"",
+            &state.credentials,
+            "us-east-1",
+        );
+        let request = Request::builder()
+            .method("PUT")
+            .uri(format!("/target/copy.txt?{query}"))
+            .header("host", "localhost:9000")
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.payload_hash)
+            .header("authorization", signed.authorization)
+            .header("x-amz-copy-source", "/source/missing.txt")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = handle(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         tokio::fs::remove_dir_all(data_dir).await.unwrap();
     }

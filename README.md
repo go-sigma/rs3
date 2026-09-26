@@ -19,7 +19,7 @@ AWS S3 and does not provide distributed storage or multi-user authorization.
 - ListObjectsV2 with prefixes, delimiters, limits, and continuation tokens
 - Byte range requests, including suffix ranges
 - DeleteObjects batch deletion
-- Multipart upload initiation, part upload, completion, and abort
+- Multipart upload initiation, part upload, part copy, completion, and abort
 - AWS streaming chunk body decoding
 - Atomic object replacement through temporary files and rename
 - Unauthenticated `/healthz` and `/readyz` probes for container health checks

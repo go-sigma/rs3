@@ -87,10 +87,12 @@ Normal object writes go to a unique temporary file in the destination
 directory and are renamed into place after a successful flush. Readers
 therefore do not observe a partially written replacement.
 
-Multipart uploads store each part as a numbered file. Completion concatenates
-the selected parts into another temporary file, renames it into the object
-path, and removes the upload directory. Abort removes the upload directory
-without creating an object.
+Multipart uploads store each part as a numbered file. UploadPartCopy reads a
+source object, applies an optional byte range, and stores the result as a
+numbered part in the same way as UploadPart. Completion concatenates the
+selected parts into another temporary file, renames it into the object path,
+and removes the upload directory. Abort removes the upload directory without
+creating an object.
 
 ## Concurrency
 

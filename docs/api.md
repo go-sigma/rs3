@@ -87,6 +87,7 @@ success.
 | ----------------------- | -------------------------------------------------- | --------------------- |
 | InitiateMultipartUpload | `POST /{bucket}/{key}?uploads`                     | `200` with `UploadId` |
 | UploadPart              | `PUT /{bucket}/{key}?uploadId={id}&partNumber={n}` | `200` with `ETag`     |
+| UploadPartCopy          | `PUT /{bucket}/{key}?uploadId={id}&partNumber={n}` | `200` with XML        |
 | CompleteMultipartUpload | `POST /{bucket}/{key}?uploadId={id}`               | `200` with XML        |
 | AbortMultipartUpload    | `DELETE /{bucket}/{key}?uploadId={id}`             | `204`                 |
 
@@ -95,8 +96,24 @@ completion XML and concatenates them in numeric order. If the request omits a
 part list, all uploaded numeric parts are used.
 
 The server does not enforce AWS minimum part sizes or maximum part counts.
-ListMultipartUploads, ListParts, UploadPartCopy, and checksum negotiation are
-not supported.
+ListMultipartUploads, ListParts, and checksum negotiation are not supported.
+
+### UploadPartCopy
+
+UploadPartCopy copies an existing object, or a byte range of one, into a
+multipart part. It is selected by the same request as UploadPart and is
+triggered when the `x-amz-copy-source` header is present:
+
+```text
+x-amz-copy-source: /{source-bucket}/{source-key}
+x-amz-copy-source-range: bytes=first-last
+```
+
+The copy source may be percent-encoded and may include a `?versionId=` suffix,
+which is ignored because versioning is not supported. When
+`x-amz-copy-source-range` is omitted, the whole source object is copied. A
+range that is not satisfiable returns `InvalidRange`. The response follows the
+standard `CopyPartResult` shape with `LastModified` and `ETag`.
 
 ## Naming Rules
 
@@ -156,4 +173,4 @@ Common errors include:
 
 Notable omissions include ACLs, bucket policies, multiple users, versioning,
 lifecycle rules, replication, server-side encryption, website hosting,
-presigned URLs, object copying, and distributed storage.
+presigned URLs, standalone CopyObject, and distributed storage.
