@@ -23,6 +23,12 @@ const MAX_BODY_SIZE: usize = 5 * 1024 * 1024 * 1024;
 const MAX_KEY_LENGTH: usize = 1024;
 const MAX_BUCKET_LENGTH: usize = 63;
 const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
+const COPY_SOURCE_HEADER: &str = "x-amz-copy-source";
+const COPY_SOURCE_IF_MATCH_HEADER: &str = "x-amz-copy-source-if-match";
+const COPY_SOURCE_IF_NONE_MATCH_HEADER: &str = "x-amz-copy-source-if-none-match";
+const COPY_SOURCE_IF_MODIFIED_SINCE_HEADER: &str = "x-amz-copy-source-if-modified-since";
+const COPY_SOURCE_IF_UNMODIFIED_SINCE_HEADER: &str = "x-amz-copy-source-if-unmodified-since";
+const METADATA_DIRECTIVE_HEADER: &str = "x-amz-metadata-directive";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -187,7 +193,7 @@ async fn dispatch(
         (&Method::PUT, false, false) if query.has("uploadId") => {
             upload_part(state, bucket, key, query, headers, body).await
         }
-        (&Method::PUT, false, false) => put_object(state, bucket, key, body).await,
+        (&Method::PUT, false, false) => put_object(state, bucket, key, headers, body).await,
         (&Method::GET, false, false) => get_object(state, bucket, key, headers).await,
         (&Method::HEAD, false, false) => head_object(state, bucket, key).await,
         (&Method::DELETE, false, false) if query.has("uploadId") => {
@@ -275,7 +281,16 @@ async fn list_buckets(state: &AppState) -> Response {
     xml_response(StatusCode::OK, xml)
 }
 
-async fn put_object(state: &AppState, bucket: &str, key: &str, body: &[u8]) -> Response {
+async fn put_object(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Response {
+    if headers.contains_key(COPY_SOURCE_HEADER) {
+        return copy_object(state, bucket, key, headers).await;
+    }
     if !state.storage.bucket_exists(bucket).await {
         return s3_error(
             StatusCode::NOT_FOUND,
@@ -290,6 +305,189 @@ async fn put_object(state: &AppState, bucket: &str, key: &str, body: &[u8]) -> R
             .expect("valid response"),
         Err(error) => internal_error("Cannot write object", error),
     }
+}
+
+/// CopyObject duplicates an existing object without streaming its payload
+/// through the client. It is selected by the `x-amz-copy-source` header on a
+/// plain PutObject request.
+async fn copy_object(state: &AppState, bucket: &str, key: &str, headers: &HeaderMap) -> Response {
+    let Some(copy_source) = header_value(headers, COPY_SOURCE_HEADER) else {
+        return invalid_request("Missing x-amz-copy-source header");
+    };
+    let Some((source_bucket, source_key)) = parse_copy_source(copy_source) else {
+        return invalid_request("Invalid copy source");
+    };
+    if !is_valid_bucket_name(&source_bucket) {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidBucketName",
+            "Source bucket name is invalid",
+        );
+    }
+    if !is_valid_key(&source_key) {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidKey",
+            "Source object key is invalid",
+        );
+    }
+    if let Some(directive) = header_value(headers, METADATA_DIRECTIVE_HEADER)
+        && !directive.eq_ignore_ascii_case("COPY")
+        && !directive.eq_ignore_ascii_case("REPLACE")
+    {
+        return s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Metadata directive must be COPY or REPLACE",
+        );
+    }
+    if !state.storage.bucket_exists(&source_bucket).await {
+        return s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "Source bucket does not exist",
+        );
+    }
+    if !state.storage.bucket_exists(bucket).await {
+        return s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "Bucket does not exist",
+        );
+    }
+    if let Some(response) =
+        copy_precondition_response(state, &source_bucket, &source_key, headers).await
+    {
+        return response;
+    }
+
+    match state
+        .storage
+        .copy_object(&source_bucket, &source_key, bucket, key)
+        .await
+    {
+        Ok(copied) => xml_response(
+            StatusCode::OK,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <LastModified>{}</LastModified><ETag>{}</ETag>\
+                 </CopyObjectResult>",
+                iso8601(copied.modified),
+                copied.etag
+            ),
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "Source object not found",
+        ),
+        Err(error) => internal_error("Cannot copy object", error),
+    }
+}
+
+/// Evaluates the `x-amz-copy-source-if-*` preconditions against the source
+/// object and returns the `412` response when the copy must be rejected.
+async fn copy_precondition_response(
+    state: &AppState,
+    source_bucket: &str,
+    source_key: &str,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let if_match = header_value(headers, COPY_SOURCE_IF_MATCH_HEADER);
+    let if_none_match = header_value(headers, COPY_SOURCE_IF_NONE_MATCH_HEADER);
+    let if_modified_since =
+        header_value(headers, COPY_SOURCE_IF_MODIFIED_SINCE_HEADER).and_then(parse_http_date);
+    let if_unmodified_since =
+        header_value(headers, COPY_SOURCE_IF_UNMODIFIED_SINCE_HEADER).and_then(parse_http_date);
+    if if_match.is_none()
+        && if_none_match.is_none()
+        && if_modified_since.is_none()
+        && if_unmodified_since.is_none()
+    {
+        return None;
+    }
+
+    let metadata = match state
+        .storage
+        .object_metadata(source_bucket, source_key)
+        .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Some(s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "Source object not found",
+            ));
+        }
+        Err(error) => return Some(internal_error("Cannot stat copy source", error)),
+    };
+    let modified = seconds(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+
+    let mut etag = String::new();
+    if if_match.is_some() || if_none_match.is_some() {
+        match state.storage.object_etag(source_bucket, source_key).await {
+            Ok(value) => etag = value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Some(s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "Source object not found",
+                ));
+            }
+            Err(error) => return Some(internal_error("Cannot read copy source", error)),
+        }
+    }
+
+    let allowed = copy_preconditions_met(
+        if_match,
+        if_none_match,
+        if_modified_since,
+        if_unmodified_since,
+        &etag,
+        modified,
+    );
+    (!allowed).then(|| {
+        s3_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "At least one copy source precondition failed",
+        )
+    })
+}
+
+/// Applies the copy source preconditions. ETag conditions take precedence over
+/// the equivalent date conditions, matching S3 behaviour.
+fn copy_preconditions_met(
+    if_match: Option<&str>,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<SystemTime>,
+    if_unmodified_since: Option<SystemTime>,
+    etag: &str,
+    modified: i64,
+) -> bool {
+    if let Some(value) = if_match {
+        if !etag_matches(value, etag) {
+            return false;
+        }
+    } else if let Some(time) = if_unmodified_since
+        && modified > seconds(time)
+    {
+        return false;
+    }
+
+    if let Some(value) = if_none_match {
+        if etag_matches(value, etag) {
+            return false;
+        }
+    } else if let Some(time) = if_modified_since
+        && modified <= seconds(time)
+    {
+        return false;
+    }
+
+    true
 }
 
 async fn get_object(state: &AppState, bucket: &str, key: &str, headers: &HeaderMap) -> Response {
@@ -506,7 +704,7 @@ async fn upload_part(
         return invalid_request("Invalid uploadId");
     }
     if let Some(copy_source) = headers
-        .get("x-amz-copy-source")
+        .get(COPY_SOURCE_HEADER)
         .and_then(|value| value.to_str().ok())
     {
         let copy_range = headers
@@ -819,6 +1017,32 @@ fn parse_copy_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     (start <= end && end < file_size).then_some((start, end))
 }
 
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// Matches an ETag condition header against an object ETag. The header may
+/// contain `*` or a comma separated list of quoted ETags.
+fn etag_matches(header: &str, etag: &str) -> bool {
+    let etag = etag.trim().trim_matches('"');
+    header.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*" || candidate.trim_matches('"') == etag
+    })
+}
+
+fn parse_http_date(value: &str) -> Option<SystemTime> {
+    DateTime::parse_from_rfc2822(value.trim())
+        .ok()
+        .map(|parsed| SystemTime::from(parsed.with_timezone(&Utc)))
+}
+
+fn seconds(time: SystemTime) -> i64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 fn parse_range(header: &str, file_size: u64) -> Option<(u64, u64)> {
     let range = header.strip_prefix("bytes=")?;
     let (start, end) = range.split_once('-')?;
@@ -998,14 +1222,16 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use super::{
-        AppState, decode_request_body, handle, is_valid_bucket_name, is_valid_key,
-        parse_copy_range, parse_copy_source, parse_range,
+        AppState, copy_preconditions_met, decode_request_body, etag_matches, handle,
+        is_valid_bucket_name, is_valid_key, parse_copy_range, parse_copy_source, parse_http_date,
+        parse_range,
     };
     use crate::config::Config;
     use axum::body::{Body, to_bytes};
     use axum::extract::State;
     use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use bytes::Bytes;
+    use std::time::{Duration, SystemTime};
     use uuid::Uuid;
 
     #[test]
@@ -1035,6 +1261,112 @@ mod tests {
         );
         assert_eq!(parse_copy_source("source-bucket"), None);
         assert_eq!(parse_copy_source("/key-only"), None);
+    }
+
+    #[test]
+    fn matches_etag_conditions() {
+        assert!(etag_matches("*", "\"abc\""));
+        assert!(etag_matches("\"abc\"", "\"abc\""));
+        assert!(etag_matches("abc", "\"abc\""));
+        assert!(etag_matches("\"xyz\", \"abc\"", "\"abc\""));
+        assert!(!etag_matches("\"xyz\"", "\"abc\""));
+    }
+
+    #[test]
+    fn parses_http_dates() {
+        assert!(parse_http_date("Thu, 29 Oct 2026 02:34:44 GMT").is_some());
+        assert!(parse_http_date("not a date").is_none());
+    }
+
+    #[test]
+    fn applies_copy_preconditions() {
+        let past = SystemTime::UNIX_EPOCH + Duration::from_secs(500);
+        let future = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+
+        assert!(copy_preconditions_met(None, None, None, None, "", 1_000));
+        assert!(copy_preconditions_met(
+            Some("\"abc\""),
+            None,
+            None,
+            None,
+            "\"abc\"",
+            1_000
+        ));
+        assert!(!copy_preconditions_met(
+            Some("\"def\""),
+            None,
+            None,
+            None,
+            "\"abc\"",
+            1_000
+        ));
+        assert!(!copy_preconditions_met(
+            None,
+            Some("\"abc\""),
+            None,
+            None,
+            "\"abc\"",
+            1_000
+        ));
+        assert!(copy_preconditions_met(
+            None,
+            Some("\"def\""),
+            None,
+            None,
+            "\"abc\"",
+            1_000
+        ));
+
+        assert!(copy_preconditions_met(
+            None,
+            None,
+            Some(past),
+            None,
+            "",
+            1_000
+        ));
+        assert!(!copy_preconditions_met(
+            None,
+            None,
+            Some(future),
+            None,
+            "",
+            1_000
+        ));
+        assert!(!copy_preconditions_met(
+            None,
+            None,
+            None,
+            Some(past),
+            "",
+            1_000
+        ));
+        assert!(copy_preconditions_met(
+            None,
+            None,
+            None,
+            Some(future),
+            "",
+            1_000
+        ));
+
+        // ETag conditions take precedence over the matching date condition.
+        assert!(copy_preconditions_met(
+            Some("\"abc\""),
+            None,
+            None,
+            Some(past),
+            "\"abc\"",
+            1_000
+        ));
+        assert!(copy_preconditions_met(
+            None,
+            Some("\"def\""),
+            Some(past),
+            None,
+            "\"abc\"",
+            1_000
+        ));
     }
 
     #[test]
@@ -1202,8 +1534,222 @@ mod tests {
         tokio::fs::remove_dir_all(data_dir).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn copy_object_duplicates_the_source() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state
+            .storage
+            .put_object("source", "object.txt", b"hello world")
+            .await
+            .unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(&state, "/target/copy.txt", "/source/object.txt", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("<CopyObjectResult"));
+        assert!(body.contains("<ETag>\"5eb63bbbe01eeed093cb22bb8f5acdc3\"</ETag>"));
+        assert_eq!(
+            state
+                .storage
+                .read_object("target", "copy.txt")
+                .await
+                .unwrap(),
+            b"hello world"
+        );
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_supports_overwriting_the_source() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state
+            .storage
+            .put_object("source", "object.txt", b"hello world")
+            .await
+            .unwrap();
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(&state, "/source/object.txt", "/source/object.txt", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .storage
+                .read_object("source", "object.txt")
+                .await
+                .unwrap(),
+            b"hello world"
+        );
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_missing_source() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(&state, "/target/copy.txt", "/source/missing.txt", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("NoSuchKey"));
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(&state, "/missing/copy.txt", "/source/object.txt", &[]),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("NoSuchBucket"));
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_honors_source_conditions() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state
+            .storage
+            .put_object("source", "object.txt", b"hello world")
+            .await
+            .unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+        let etag = "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"";
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(
+                &state,
+                "/target/copy.txt",
+                "/source/object.txt",
+                &[("x-amz-copy-source-if-match", "\"deadbeef\"")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(
+                &state,
+                "/target/copy.txt",
+                "/source/object.txt",
+                &[("x-amz-copy-source-if-none-match", etag)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        assert!(
+            state
+                .storage
+                .read_object("target", "copy.txt")
+                .await
+                .is_err()
+        );
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(
+                &state,
+                "/target/copy.txt",
+                "/source/object.txt",
+                &[("x-amz-copy-source-if-match", etag)],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state
+                .storage
+                .read_object("target", "copy.txt")
+                .await
+                .unwrap(),
+            b"hello world"
+        );
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn copy_object_rejects_invalid_metadata_directive() {
+        let data_dir = std::env::temp_dir().join(format!("rs3-test-{}", Uuid::new_v4()));
+        let state = AppState::new(test_config(data_dir.clone())).await.unwrap();
+        state.storage.create_bucket("source").await.unwrap();
+        state
+            .storage
+            .put_object("source", "object.txt", b"hello world")
+            .await
+            .unwrap();
+        state.storage.create_bucket("target").await.unwrap();
+
+        let response = handle(
+            State(state.clone()),
+            copy_request(
+                &state,
+                "/target/copy.txt",
+                "/source/object.txt",
+                &[("x-amz-metadata-directive", "MERGE")],
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        tokio::fs::remove_dir_all(data_dir).await.unwrap();
+    }
+
     fn request(path: &str) -> Request<Body> {
         Request::builder().uri(path).body(Body::empty()).unwrap()
+    }
+
+    fn copy_request(
+        state: &AppState,
+        destination: &str,
+        source: &str,
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let signed = crate::auth::sign_request(
+            "PUT",
+            destination,
+            "",
+            "localhost:9000",
+            b"",
+            &state.credentials,
+            "us-east-1",
+        );
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri(destination)
+            .header("host", "localhost:9000")
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.payload_hash)
+            .header("authorization", signed.authorization)
+            .header("x-amz-copy-source", source);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).unwrap()
     }
 
     fn test_config(data_dir: std::path::PathBuf) -> Config {

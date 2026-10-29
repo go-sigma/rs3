@@ -34,7 +34,7 @@ HTTP method, bucket/key path, and query parameters.
 | `config.rs` | CLI flags, environment variables, and listen address |
 | `auth.rs` | AWS SigV4 signing, canonicalization, verification, and payload checks |
 | `server.rs` | Request validation, operation dispatch, XML responses, and range handling |
-| `storage.rs` | Bucket, object, listing, and multipart filesystem operations |
+| `storage.rs` | Bucket, object, copy, listing, and multipart filesystem operations |
 | `client.rs` | Signed HTTP client and XML parsing used by `rs3-cli` |
 | `bin/rs3-cli.rs` | User-facing bucket and object commands |
 
@@ -86,6 +86,12 @@ constructed.
 Normal object writes go to a unique temporary file in the destination
 directory and are renamed into place after a successful flush. Readers
 therefore do not observe a partially written replacement.
+
+CopyObject streams the source object through a 64 KiB buffer into a temporary
+file next to the destination, computing the MD5 ETag on the way, and renames it
+into place. The payload never leaves the server, and copying an object onto
+itself is safe because the source file is opened before the destination is
+replaced.
 
 Multipart uploads store each part as a numbered file. UploadPartCopy reads a
 source object, applies an optional byte range, and stores the result as a

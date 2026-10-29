@@ -15,7 +15,8 @@ AWS S3 and does not provide distributed storage or multi-user authorization.
 
 - AWS Signature Version 4 header authentication
 - List, create, inspect, and delete buckets
-- Put, get, inspect, and delete objects
+- Put, get, inspect, copy, and delete objects
+- Server-side CopyObject with source preconditions
 - ListObjectsV2 with prefixes, delimiters, limits, and continuation tokens
 - Byte range requests, including suffix ranges
 - DeleteObjects batch deletion
@@ -100,8 +101,9 @@ cargo run --release --bin rs3-cli -- rb s3://mybucket
 ```
 
 The client handles one object per `cp` invocation. Recursive transfers,
-server-side copies, policies, identities, lifecycle rules, and replication are
-not implemented.
+server-side copies from the CLI, policies, identities, lifecycle rules, and
+replication are not implemented. Server-side copies are available through the
+API, see [CopyObject](docs/api.md#copyobject).
 
 ## Docker
 

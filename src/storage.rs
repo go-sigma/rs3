@@ -4,11 +4,12 @@ use std::time::SystemTime;
 
 use md5::{Digest, Md5};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 const FOLDER_MARKER: &str = ".folder_marker";
+const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Storage {
@@ -24,6 +25,12 @@ pub struct ObjectInfo {
 
 #[derive(Debug)]
 pub struct CompletedUpload {
+    pub etag: String,
+}
+
+#[derive(Debug)]
+pub struct CopiedObject {
+    pub modified: SystemTime,
     pub etag: String,
 }
 
@@ -122,6 +129,61 @@ impl Storage {
 
     pub async fn read_object(&self, bucket: &str, key: &str) -> io::Result<Vec<u8>> {
         fs::read(self.object_path(bucket, key)).await
+    }
+
+    /// Copies an object inside the storage backend without streaming its
+    /// contents through the caller. Overwriting the source key is allowed and
+    /// behaves like any other replacement, because the copy is written to a
+    /// temporary file that is renamed into place at the end.
+    pub async fn copy_object(
+        &self,
+        source_bucket: &str,
+        source_key: &str,
+        target_bucket: &str,
+        target_key: &str,
+    ) -> io::Result<CopiedObject> {
+        let mut source = fs::File::open(self.object_path(source_bucket, source_key)).await?;
+        let target_path = self.object_path(target_bucket, target_key);
+        let parent = target_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "object has no parent"))?;
+        fs::create_dir_all(parent).await?;
+
+        let temporary = parent.join(format!(".rs3-copy-{}", Uuid::new_v4()));
+        let mut target = fs::File::create(&temporary).await?;
+        let mut hasher = Md5::new();
+        let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+
+        let result = async {
+            loop {
+                let read = source.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+                target.write_all(&buffer[..read]).await?;
+            }
+            target.flush().await?;
+            drop(target);
+            fs::rename(&temporary, &target_path).await
+        }
+        .await;
+
+        if let Err(error) = result {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+
+        let metadata = fs::metadata(&target_path).await?;
+        Ok(CopiedObject {
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            etag: format!("\"{}\"", hex::encode(hasher.finalize())),
+        })
+    }
+
+    /// Computes the ETag of a stored object without loading it into memory.
+    pub async fn object_etag(&self, bucket: &str, key: &str) -> io::Result<String> {
+        md5_file(&self.object_path(bucket, key)).await
     }
 
     pub async fn object_metadata(&self, bucket: &str, key: &str) -> io::Result<std::fs::Metadata> {
@@ -271,6 +333,20 @@ impl Storage {
 
 pub fn md5_etag(body: &[u8]) -> String {
     format!("\"{}\"", hex::encode(Md5::digest(body)))
+}
+
+async fn md5_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Md5::new();
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("\"{}\"", hex::encode(hasher.finalize())))
 }
 
 fn collect_objects(bucket_path: &Path) -> io::Result<Vec<ObjectInfo>> {

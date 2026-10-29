@@ -42,6 +42,7 @@ Deleting a non-empty bucket returns `BucketNotEmpty`. Listing supports:
 | Operation     | Request                  | Success                     |
 | ------------- | ------------------------ | --------------------------- |
 | PutObject     | `PUT /{bucket}/{key}`    | `200` with `ETag`           |
+| CopyObject    | `PUT /{bucket}/{key}`    | `200` with XML              |
 | GetObject     | `GET /{bucket}/{key}`    | `200` with object body      |
 | HeadObject    | `HEAD /{bucket}/{key}`   | `200` with metadata headers |
 | DeleteObject  | `DELETE /{bucket}/{key}` | `204`                       |
@@ -53,6 +54,36 @@ checksums other than ETag, conditional requests, and object tags are not
 persisted.
 
 DeleteObject is idempotent and returns `204` for a missing key.
+
+### CopyObject
+
+CopyObject duplicates an object on the server without streaming its payload
+through the client. It uses the PutObject request shape and is selected by the
+`x-amz-copy-source` header:
+
+```text
+x-amz-copy-source: /{source-bucket}/{source-key}
+```
+
+The source may be percent-encoded and may include a `?versionId=` suffix, which
+is ignored because versioning is not supported. Copying an object onto itself
+is allowed. The source bucket must exist, and a missing source object returns
+`NoSuchKey`. The response follows the standard `CopyObjectResult` shape with
+`LastModified` and `ETag`.
+
+The following preconditions are evaluated against the source object and return
+`412 PreconditionFailed` when they do not hold:
+
+- `x-amz-copy-source-if-match`
+- `x-amz-copy-source-if-none-match`
+- `x-amz-copy-source-if-modified-since`
+- `x-amz-copy-source-if-unmodified-since`
+
+As in S3, an ETag condition takes precedence over the matching date condition
+when both are supplied. `x-amz-metadata-directive` only accepts `COPY` or
+`REPLACE`; both are treated the same because user metadata is not persisted.
+On S3, CopyObject is typically used to move an object by copying it to a new key
+and then deleting the original.
 
 ### Range Requests
 
@@ -173,4 +204,4 @@ Common errors include:
 
 Notable omissions include ACLs, bucket policies, multiple users, versioning,
 lifecycle rules, replication, server-side encryption, website hosting,
-presigned URLs, standalone CopyObject, and distributed storage.
+presigned URLs, and distributed storage.
